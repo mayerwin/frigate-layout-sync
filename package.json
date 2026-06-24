@@ -1,0 +1,24 @@
+{
+  "name": "frigate-layout-sync",
+  "version": "0.2.0",
+  "description": "Save, restore and sync Frigate camera-group dashboard layouts across devices, with responsive max-width breakpoints. A tiny companion service that makes Frigate's own nginx inject a small Save/Load UI (no reverse proxy).",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "nginx:apply": "node src/nginx.js apply",
+    "nginx:remove": "node src/nginx.js remove",
+    "test": "node test/e2e.js",
+    "test:allcameras": "node test/all-cameras.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}

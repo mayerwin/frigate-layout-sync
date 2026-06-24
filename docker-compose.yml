@@ -1,0 +1,46 @@
+# frigate-layout-sync — companion alongside Frigate. NO reverse proxy.
+#
+# Frigate keeps its normal port (8971) and serves everything itself. The companion
+# edits Frigate's nginx (over the Docker socket) to inject one <script> and route
+# /__layoutsync/* to itself, and re-applies automatically on every Frigate restart.
+#
+# To add it to YOUR existing Frigate compose: copy the `frigate-layout-sync`
+# service and the `layoutsync` network below, and add `networks: [layoutsync]` to
+# your own frigate service so its nginx can reach the companion by name.
+
+services:
+  # Your existing Frigate — unchanged except for joining the shared network.
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: frigate           # must match FRIGATE_CONTAINER below
+    restart: unless-stopped
+    shm_size: "256mb"
+    ports:
+      - "8971:8971"                   # Frigate stays on its normal port — no move
+    volumes:
+      - ./frigate/config:/config
+      - ./frigate/storage:/media/frigate
+    networks:
+      - layoutsync
+    # ...your cameras / detectors / devices as usual...
+
+  frigate-layout-sync:
+    build: .
+    # image: ghcr.io/mayerwin/frigate-layout-sync:latest   # once published
+    container_name: frigate-layout-sync
+    restart: unless-stopped
+    environment:
+      FRIGATE_CONTAINER: frigate                  # the Frigate container to edit
+      LAYOUTSYNC_UPSTREAM: frigate-layout-sync:3000
+    volumes:
+      # Needed to keep Frigate's nginx injection in place + reload it on upgrades.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Layouts live here. Tip: point this inside Frigate's /config so backups cover it.
+      - ./frigate/config/layout-sync:/app/data
+    networks:
+      - layoutsync
+    depends_on:
+      - frigate
+
+networks:
+  layoutsync:
