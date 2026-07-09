@@ -63,7 +63,17 @@ server {
 ## The two files you own
 
 1. **`inject/<EXT_ID>.html`** — your one `<script>` tag, e.g.
-   `<script src="/__yourprefix/inject.js" defer></script>` — **no single quotes** (it goes inside a single-quoted nginx string) and **no newline**.
+   `<script src=/__yourprefix/inject.js defer></script>`. It **must be
+   JS-string-safe**: no quote of any kind (single **or** double), no backslash,
+   no newline. Why: Frigate's `location /` sets `sub_filter_types text/css
+   application/javascript`, so the combined `sub_filter '</body>'` also runs on JS
+   (and CSS), not just HTML. Any JS bundle that contains the literal `</body>` in
+   a string — Frigate's Monaco **ConfigEditor** does — gets your tag spliced into
+   that string; a quote (or backslash) there terminates/escapes the JS string →
+   `SyntaxError`, and Frigate's Config page renders **blank**. Use an **unquoted**
+   `src` (valid HTML5 when the path has no spaces or quotes). The single-quote ban
+   is doubly required because the tag is also concatenated into a single-quoted
+   nginx string.
 2. **`locations/<EXT_ID>.conf`** — your nginx location, e.g.
    ```nginx
    location /__yourprefix/ {

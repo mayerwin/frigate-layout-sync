@@ -88,8 +88,14 @@ Set `NGINX_AUTOCONFIG=false` and wire Frigate's nginx yourself. Frigate
 Add, **inside `location / { … }`**:
 
 ```nginx
-sub_filter '</body>' '<script src="/__layoutsync/inject.js" defer></script></body>';
+sub_filter '</body>' '<script src=/__layoutsync/inject.js defer></script></body>';
 ```
+
+The `src` is deliberately **unquoted**: Frigate's `location /` sets
+`sub_filter_types text/css application/javascript`, so this `sub_filter` also runs
+on JS bundles. A bundle containing `</body>` in a string (Frigate's ConfigEditor)
+would get this tag spliced into that string, and a quoted `src` would terminate
+the JS string (`SyntaxError`, blank page). Unquoted is valid HTML5 here.
 
 and, **inside `server { … }`** (a sibling of `location /`):
 

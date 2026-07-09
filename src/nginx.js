@@ -30,7 +30,15 @@ const MANAGED = '# frigate-ext (managed)';
 const EXT_ID = 'frigate-layout-sync';
 const BASE = '/__layoutsync';
 const ROUTE = BASE + '/';
-const INJECT_TAG = `<script src="${BASE}/inject.js" defer></script>`; // no single quotes!
+// JS-string-safe tag: Frigate's `location /` sets `sub_filter_types text/css
+// application/javascript`, so the shared `sub_filter '</body>'` also runs on JS
+// bundles. A bundle carrying the literal "</body>" in a string (Frigate's Monaco
+// ConfigEditor does) gets this tag spliced INTO that string, so it must contain
+// NO character that can terminate a JS string or the nginx string: no quote of
+// any kind, no backslash, no newline. Hence the UNQUOTED src (valid HTML5). A
+// double-quoted src here blanked Frigate's Config page (SyntaxError). See
+// PROTOCOL.md and frigate-better-face-recognition #5.
+const INJECT_TAG = `<script src=${BASE}/inject.js defer></script>`;
 
 const CONTAINER = process.env.FRIGATE_CONTAINER || 'frigate';
 const CONF = process.env.FRIGATE_NGINX_CONF || '/usr/local/nginx/conf/nginx.conf';
