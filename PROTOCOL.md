@@ -89,21 +89,22 @@ server {
 
 Access Docker via `docker exec <frigate-container> ...` (mount `/var/run/docker.sock`
 into your companion). Run **`ensure()`** at startup, on every Frigate (re)start, and
-on a ~30s timer:
+on a ~30s timer. Everything happens in **one shell pass under `flock <LOCK>`**, and it keeps a flag
+`C` recording whether that pass changed anything on disk:
 
-1. **Write your two files atomically** (`mkdir -p` the dir, write `<file>.tmp`, `mv`). No lock needed (distinct filenames per extension).
-2. **Under `flock <LOCK>` (one shell pass):**
-   a. `mkdir -p inject locations generated`.
-   b. **Ensure the include lines** (each idempotent — check with `grep -F` so an upgrade adds a missing one): the `generated/*.conf` include after `root /opt/frigate/web`, the `locations/*.conf` include before `location / {`, each tagged with the managed marker.
-   c. **Regenerate the combined sub_filter** — this MUST be byte-identical logic in every extension so concurrent runs converge:
-      ```sh
-      TAGS=$(cat <ext-root>/inject/*.html 2>/dev/null | tr -d '\r\n')
-      if [ -n "$TAGS" ]; then
-        printf "sub_filter '</body>' '%s</body>';\n" "$TAGS" > <ext-root>/generated/subfilter.conf.tmp \
-          && mv <ext-root>/generated/subfilter.conf.tmp <ext-root>/generated/subfilter.conf
-      else rm -f <ext-root>/generated/subfilter.conf; fi
-      ```
-   d. **`nginx -t`; if OK `nginx -s reload`.** If `nginx -t` **fails**, remove **only your own** `inject/<EXT_ID>.html` + `locations/<EXT_ID>.conf`, regenerate, recover, and report — so a bad apply never leaves the running nginx broken.
+1. `C=0`; `mkdir -p inject locations generated`.
+2. **Write your two files only if their bytes differ** (write `<file>.t`, `cmp -s` it against the current file, `mv` + `C=1` if different, else delete the `.t`). Distinct filenames per extension, so extensions never touch each other's inputs.
+3. **Ensure the include lines** (each idempotent: check with `grep -F` so an upgrade adds a missing one; set `C=1` when you add one): the `generated/*.conf` include after `root /opt/frigate/web`, the `locations/*.conf` include before `location / {`, each tagged with the managed marker.
+4. **Regenerate the combined sub_filter.** The OUTPUT bytes MUST be identical in every extension so concurrent runs converge, and it is compared before replacing:
+   ```sh
+   TAGS=$(cat <ext-root>/inject/*.html 2>/dev/null | tr -d '\r\n'); F=<ext-root>/generated/subfilter.conf
+   if [ -n "$TAGS" ]; then
+     printf "sub_filter '</body>' '%s</body>';\n" "$TAGS" > "$F.t" &&
+       if cmp -s "$F.t" "$F"; then rm -f "$F.t"; else mv "$F.t" "$F"; C=1; fi
+   elif [ -e "$F" ]; then rm -f "$F"; C=1; fi
+   ```
+5. **If `C=0`, stop here: do NOT reload.** This is a MUST, not an optimisation. Every `nginx -s reload` grows the RSS of Frigate's nginx master process (about 240 KB per reload, measured on nginx 1.27.4 in Frigate 0.18), so an extension that reloads on every 30s tick (two extensions: every 15s) runs Frigate's nginx out of memory within days.
+6. **Otherwise `nginx -t`; if OK `nginx -s reload`.** If `nginx -t` **fails**, remove **only your own** `inject/<EXT_ID>.html` + `locations/<EXT_ID>.conf`, regenerate, recover, and report, so a bad apply never leaves the running nginx broken. Back off the timer-driven retries after a failure (the rollback reloads too).
 
 **Self-heal:** a Frigate upgrade recreates the container from a fresh image, wiping
 everything. Watch `docker events --filter type=container --filter event=start` and
@@ -117,7 +118,8 @@ recreated one). The ~30s timer is the backstop.
 ## Why this is race-free
 
 - **The combined sub_filter** is deterministic from `inject/*.html`, so whichever extension regenerates it last produces the same correct result; it's rebuilt under the lock.
-- **Per-extension inputs** are separate files written atomically (`tmp`+`mv`) — two extensions can't corrupt or overwrite each other.
+- **Reloads are change-gated**: in steady state every extension's 30s pass changes nothing on disk, so nginx reloads only when some file actually changed (a Frigate restart/upgrade, a new or removed extension).
+- **Per-extension inputs** are separate files written atomically (`.t`+`mv`) — two extensions can't corrupt or overwrite each other.
 - **Include edits + reloads** run under the shared `flock`, so `nginx -t` always sees a consistent set of files and reloads don't interleave.
 
 ## Migration note (v1 → v2)

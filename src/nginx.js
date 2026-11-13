@@ -16,7 +16,8 @@
 //                            (output) — regenerated from inject/*.html on every apply
 // nginx.conf gets two idempotent `include` lines (combined sub_filter inside
 // `location /`; locations inside `server`). Every nginx.conf edit / regen / reload
-// runs under a shared `flock` so concurrent extensions serialize.
+// runs under a shared `flock` so concurrent extensions serialize, and nginx is only
+// reloaded when that pass actually changed a file (see applyScript()).
 const { execFile, spawn } = require('child_process');
 
 // ============================== SHARED PROTOCOL ==============================
@@ -69,32 +70,55 @@ function locationConf() {
 }
 
 // --------------------------------------------------------- the locked critical section
-// One flock'd shell pass: migrate legacy bits, ensure the two include lines, then
-// REGENERATE the single combined sub_filter from all inject/*.html, validate and
-// reload (rolling back only THIS extension's inputs on failure).
+// Single-quote a value for sh (the content we pass contains `$` and `"`).
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+// put FILE CONTENT: write only if the bytes differ, and mark the pass as changed.
+// Writing is atomic (tmp + mv) so nginx never sees a half file.
+const PUT_FN =
+  `put() { printf '%s' "$2" > "$1.t" && if cmp -s "$1.t" "$1"; then rm -f "$1.t"; else mv "$1.t" "$1"; C=1; fi; }`;
+
+// Regenerate the single combined sub_filter from all inject/*.html. The OUTPUT
+// bytes must be identical in every extension so concurrent runs converge; it is
+// compared before replacing so an unchanged set of tags is not a change.
+const REGEN =
+  `T=$(cat '${INJECT_DIR}/'*.html 2>/dev/null | tr -d '\\r\\n'); F='${GEN_DIR}/subfilter.conf'; ` +
+  `if [ -n "$T" ]; then printf "sub_filter '</body>' '%s</body>';\\n" "$T" > "$F.t" && ` +
+  `if cmp -s "$F.t" "$F"; then rm -f "$F.t"; else mv "$F.t" "$F"; C=1; fi; ` +
+  `elif [ -e "$F" ]; then rm -f "$F"; C=1; fi`;
+
+// One flock'd shell pass: write our two inputs, migrate legacy bits, ensure the two
+// include lines, regenerate the combined sub_filter. Every step records whether it
+// changed anything on disk, and nginx is validated + reloaded ONLY if something did.
+// Reloading unconditionally is not harmless: each `nginx -s reload` grows Frigate's
+// nginx master RSS (~240 KB/reload measured on nginx 1.27.4 in Frigate 0.18), so a
+// 30s backstop that always reloaded ran it out of memory within days.
+// On a failed `nginx -t`, roll back only THIS extension's inputs and recover.
 function applyScript() {
-  const REGEN =
-    `T=$(cat '${INJECT_DIR}/'*.html 2>/dev/null | tr -d '\\r\\n'); ` +
-    `if [ -n "$T" ]; then printf "sub_filter '</body>' '%s</body>';\\n" "$T" > '${GEN_DIR}/subfilter.conf.t' && mv '${GEN_DIR}/subfilter.conf.t' '${GEN_DIR}/subfilter.conf'; ` +
-    `else rm -f '${GEN_DIR}/subfilter.conf'; fi`;
   return [
+    `C=0`,
+    PUT_FN,
     `mkdir -p '${INJECT_DIR}' '${LOCATION_DIR}' '${GEN_DIR}'`,
+    `put '${INJECT_DIR}/${EXT_ID}.html' ${shq(INJECT_TAG)}`,
+    `put '${LOCATION_DIR}/${EXT_ID}.conf' ${shq(locationConf())}`,
     // migrate away older versions of THIS extension (direct block + per-ext sub_filter)
     `if grep -q '>>> ${EXT_ID} (managed)' '${CONF}' 2>/dev/null || grep -q '${EXT_ID} sub_filter' '${CONF}' 2>/dev/null; then`,
     `  sed -i '/${EXT_ID} sub_filter/d' '${CONF}'`,
-    `  awk '/>>> ${EXT_ID}/{s=1} /<<< ${EXT_ID}/{s=0;next} !s' '${CONF}' > '${CONF}.fls.t' && mv '${CONF}.fls.t' '${CONF}'`,
+    `  awk '/>>> ${EXT_ID}/{s=1} /<<< ${EXT_ID}/{s=0;next} !s' '${CONF}' > '${CONF}.fls.t' && mv '${CONF}.fls.t' '${CONF}'; C=1`,
     `fi`,
-    `rm -f '${EXT_ROOT}/subfilters/${EXT_ID}.conf'`, // superseded by the combined sub_filter
+    // superseded by the combined sub_filter
+    `if [ -e '${EXT_ROOT}/subfilters/${EXT_ID}.conf' ]; then rm -f '${EXT_ROOT}/subfilters/${EXT_ID}.conf'; C=1; fi`,
     // idempotent include lines (checked individually so upgrades add the new one)
     `if ! grep -qF 'frigate-ext/locations/*.conf' '${CONF}'; then`,
-    `  awk '{ if (!L && index($0, "location / {")) { print "        include ${LOCATION_DIR}/*.conf; ${MANAGED}"; L=1 } print }' '${CONF}' > '${CONF}.fls.t' && mv '${CONF}.fls.t' '${CONF}'`,
+    `  awk '{ if (!L && index($0, "location / {")) { print "        include ${LOCATION_DIR}/*.conf; ${MANAGED}"; L=1 } print }' '${CONF}' > '${CONF}.fls.t' && mv '${CONF}.fls.t' '${CONF}'; C=1`,
     `fi`,
     `if ! grep -qF 'frigate-ext/generated/*.conf' '${CONF}'; then`,
-    `  awk '{ print; if (!S && index($0, "root /opt/frigate/web")) { print "            include ${GEN_DIR}/*.conf; ${MANAGED}"; S=1 } }' '${CONF}' > '${CONF}.fls.t' && mv '${CONF}.fls.t' '${CONF}'`,
+    `  awk '{ print; if (!S && index($0, "root /opt/frigate/web")) { print "            include ${GEN_DIR}/*.conf; ${MANAGED}"; S=1 } }' '${CONF}' > '${CONF}.fls.t' && mv '${CONF}.fls.t' '${CONF}'; C=1`,
     `fi`,
     REGEN,
+    `if [ "$C" = 0 ]; then echo FLS_UNCHANGED; exit 0; fi`,
     `if nginx -t 2>/tmp/fls-nginxt; then`,
-    `  nginx -s reload 2>/dev/null; echo FLS_OK`,
+    `  nginx -s reload 2>/dev/null; echo FLS_RELOADED`,
     `else`,
     `  rm -f '${INJECT_DIR}/${EXT_ID}.html' '${LOCATION_DIR}/${EXT_ID}.conf'`,
     `  ${REGEN}`,
@@ -115,27 +139,38 @@ function docker(args, input) {
   });
 }
 const lockedSh = (script) => docker(['exec', CONTAINER, 'flock', '-w', '30', LOCK, 'sh', '-c', script]);
-const writeFile = (file, content) => {
-  const dir = file.replace(/\/[^/]*$/, ''); // ensure the dir exists (inject/ may not yet)
-  return docker(['exec', '-i', CONTAINER, 'sh', '-c', `mkdir -p '${dir}' && cat > '${file}.tmp' && mv '${file}.tmp' '${file}'`], content);
-};
 
 // --------------------------------------------------------- apply (idempotent + safe)
+// A failing apply rolls back and reloads, so retrying it every 30s would bring
+// back the reload churn. Back off the timer-driven retries instead (30s -> 30min).
+let failures = 0;
+let nextTimerTry = 0;
+
 async function ensure() {
   if (!AUTO || busy) return;
   busy = true;
   try {
-    await writeFile(`${INJECT_DIR}/${EXT_ID}.html`, INJECT_TAG);   // my <script> tag (no trailing newline)
-    await writeFile(`${LOCATION_DIR}/${EXT_ID}.conf`, locationConf());
-    await lockedSh(applyScript());
-    if (!state.applied) console.log(`[frigate-layout-sync] injected into ${CONTAINER} nginx (route ${ROUTE} -> ${UPSTREAM})`);
+    const out = String(await lockedSh(applyScript()));
+    if (out.includes('FLS_RELOADED')) {
+      console.log(state.applied
+        ? `[frigate-layout-sync] nginx injection drifted; re-applied and reloaded ${CONTAINER} nginx`
+        : `[frigate-layout-sync] injected into ${CONTAINER} nginx (route ${ROUTE} -> ${UPSTREAM})`);
+    }
     state = { ...state, mode: 'managed', applied: true, lastError: null };
+    failures = 0;
+    nextTimerTry = 0;
   } catch (e) {
     state = { ...state, applied: false, lastError: e.message };
+    failures += 1;
+    nextTimerTry = Date.now() + Math.min(30000 * 2 ** failures, 30 * 60 * 1000);
     console.error('[frigate-layout-sync] nginx ensure failed:', e.message);
   } finally {
     busy = false;
   }
+}
+
+function ensureFromTimer() {
+  if (Date.now() >= nextTimerTry) return ensure();
 }
 
 async function ensureWithRetry(tries = 24, delayMs = 5000) {
@@ -182,14 +217,16 @@ async function start() {
   watch();
 
   // Backstop: ensure() re-reads live state, so a missing injection self-heals <30s.
-  setInterval(() => ensure(), 30 * 1000).unref();
+  // When nothing drifted it is one `docker exec` that changes nothing and no reload.
+  setInterval(() => ensureFromTimer(), 30 * 1000).unref();
 }
 
 // Remove ONLY this extension's files + regenerate the combined sub_filter + reload.
 async function remove() {
   await lockedSh([
     `rm -f '${INJECT_DIR}/${EXT_ID}.html' '${LOCATION_DIR}/${EXT_ID}.conf'`,
-    `T=$(cat '${INJECT_DIR}/'*.html 2>/dev/null | tr -d '\\r\\n'); if [ -n "$T" ]; then printf "sub_filter '</body>' '%s</body>';\\n" "$T" > '${GEN_DIR}/subfilter.conf'; else rm -f '${GEN_DIR}/subfilter.conf'; fi`,
+    `C=0`,
+    REGEN,
     `nginx -t >/dev/null 2>&1 && nginx -s reload 2>/dev/null`,
     `echo removed`,
   ].join('\n'));
