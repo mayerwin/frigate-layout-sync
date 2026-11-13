@@ -53,7 +53,7 @@ services:
     # ...your usual frigate config...
 
   frigate-layout-sync:
-    build: .                           # or image: ghcr.io/mayerwin/frigate-layout-sync:latest
+    build: .                           # builds from source (no prebuilt image is published)
     container_name: frigate-layout-sync
     restart: unless-stopped
     environment:
