@@ -88,8 +88,8 @@ server {
 ## The algorithm
 
 Access Docker via `docker exec <frigate-container> ...` (mount `/var/run/docker.sock`
-into your companion). Run **`ensure()`** at startup, on every Frigate (re)start, and
-on a ~30s timer. Everything happens in **one shell pass under `flock <LOCK>`**, and it keeps a flag
+into your companion). Run **`ensure()`** at startup and on every Frigate container
+start (see Self-heal); do **not** poll it on a short timer. Everything happens in **one shell pass under `flock <LOCK>`**, and it keeps a flag
 `C` recording whether that pass changed anything on disk:
 
 1. `C=0`; `mkdir -p inject locations generated`.
@@ -103,14 +103,22 @@ on a ~30s timer. Everything happens in **one shell pass under `flock <LOCK>`**, 
        if cmp -s "$F.t" "$F"; then rm -f "$F.t"; else mv "$F.t" "$F"; C=1; fi
    elif [ -e "$F" ]; then rm -f "$F"; C=1; fi
    ```
-5. **If `C=0`, stop here: do NOT reload.** This is a MUST, not an optimisation. Every `nginx -s reload` grows the RSS of Frigate's nginx master process (about 240 KB per reload, measured on nginx 1.27.4 in Frigate 0.18), so an extension that reloads on every 30s tick (two extensions: every 15s) runs Frigate's nginx out of memory within days.
-6. **Otherwise `nginx -t`; if OK `nginx -s reload`.** If `nginx -t` **fails**, remove **only your own** `inject/<EXT_ID>.html` + `locations/<EXT_ID>.conf`, regenerate, recover, and report, so a bad apply never leaves the running nginx broken. Back off the timer-driven retries after a failure (the rollback reloads too).
+5. **If `C=0`, stop here: do NOT reload.** This is a MUST, not an optimisation. Every `nginx -s reload` grows the RSS of Frigate's nginx master process (about 240 KB per reload, measured on nginx 1.27.4 in Frigate 0.18), so the original reference implementation, which reloaded on a 30s timer (two extensions: every 15s), ran Frigate's nginx out of memory within days.
+6. **Otherwise `nginx -t`; if OK `nginx -s reload`.** If `nginx -t` **fails**, remove **only your own** `inject/<EXT_ID>.html` + `locations/<EXT_ID>.conf`, regenerate, recover, and report, so a bad apply never leaves the running nginx broken.
 
-**Self-heal:** a Frigate upgrade recreates the container from a fresh image, wiping
-everything. Watch `docker events --filter type=container --filter event=start` and
-re-run `ensure()` when the **event actor name** equals the Frigate container (do
-**not** use `--filter container=<name>` — it binds to the old id and misses the
-recreated one). The ~30s timer is the backstop.
+**Self-heal (event-driven):** Frigate's `nginx.conf` comes only from its image. An
+nginx restart inside the container (s6) regenerates `base_path.conf` and
+`listen.conf`, not `nginx.conf`, and a container restart keeps the writable layer,
+so the injection survives both. It is lost only when the container is **recreated**
+(a Frigate upgrade), and that always emits a Docker `start` event. So: watch
+`docker events --filter type=container --filter event=start` and re-run `ensure()`
+when the **event actor name** equals the Frigate container (do **not** use
+`--filter container=<name>`: it binds to the old id and misses the recreated one).
+Start watching **before** the first apply, and if the event stream drops, reconnect
+with `--since <time it dropped>` so a start that happened meanwhile is replayed.
+An optional slow safety net (the reference uses hourly) covers the unforeseen,
+such as a manual edit or a future Frigate that rebuilds `nginx.conf` on nginx
+restart; with change-gated reloads it costs one `docker exec` and no reload.
 
 **Uninstall:** under the lock, delete only your `inject/<EXT_ID>.html` +
 `locations/<EXT_ID>.conf`, regenerate the combined sub_filter, reload.
@@ -118,7 +126,7 @@ recreated one). The ~30s timer is the backstop.
 ## Why this is race-free
 
 - **The combined sub_filter** is deterministic from `inject/*.html`, so whichever extension regenerates it last produces the same correct result; it's rebuilt under the lock.
-- **Reloads are change-gated**: in steady state every extension's 30s pass changes nothing on disk, so nginx reloads only when some file actually changed (a Frigate restart/upgrade, a new or removed extension).
+- **Reloads are change-gated**: an `ensure()` that finds everything in place changes nothing on disk, so nginx reloads only when some file actually changed (a Frigate upgrade, a new or removed extension).
 - **Per-extension inputs** are separate files written atomically (`.t`+`mv`) — two extensions can't corrupt or overwrite each other.
 - **Include edits + reloads** run under the shared `flock`, so `nginx -t` always sees a consistent set of files and reloads don't interleave.
 

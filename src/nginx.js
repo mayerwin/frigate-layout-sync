@@ -92,7 +92,7 @@ const REGEN =
 // changed anything on disk, and nginx is validated + reloaded ONLY if something did.
 // Reloading unconditionally is not harmless: each `nginx -s reload` grows Frigate's
 // nginx master RSS (~240 KB/reload measured on nginx 1.27.4 in Frigate 0.18), so a
-// 30s backstop that always reloaded ran it out of memory within days.
+// 30s timer that always reloaded (the old design) ran it out of memory within days.
 // On a failed `nginx -t`, roll back only THIS extension's inputs and recover.
 function applyScript() {
   return [
@@ -141,11 +141,6 @@ function docker(args, input) {
 const lockedSh = (script) => docker(['exec', CONTAINER, 'flock', '-w', '30', LOCK, 'sh', '-c', script]);
 
 // --------------------------------------------------------- apply (idempotent + safe)
-// A failing apply rolls back and reloads, so retrying it every 30s would bring
-// back the reload churn. Back off the timer-driven retries instead (30s -> 30min).
-let failures = 0;
-let nextTimerTry = 0;
-
 async function ensure() {
   if (!AUTO || busy) return;
   busy = true;
@@ -157,20 +152,12 @@ async function ensure() {
         : `[frigate-layout-sync] injected into ${CONTAINER} nginx (route ${ROUTE} -> ${UPSTREAM})`);
     }
     state = { ...state, mode: 'managed', applied: true, lastError: null };
-    failures = 0;
-    nextTimerTry = 0;
   } catch (e) {
     state = { ...state, applied: false, lastError: e.message };
-    failures += 1;
-    nextTimerTry = Date.now() + Math.min(30000 * 2 ** failures, 30 * 60 * 1000);
     console.error('[frigate-layout-sync] nginx ensure failed:', e.message);
   } finally {
     busy = false;
   }
-}
-
-function ensureFromTimer() {
-  if (Date.now() >= nextTimerTry) return ensure();
 }
 
 async function ensureWithRetry(tries = 24, delayMs = 5000) {
@@ -197,13 +184,26 @@ async function start() {
     manualHint();
     return;
   }
-  await ensureWithRetry();
-
-  // Re-apply on every Frigate (re)start (an upgrade recreates the container from a
-  // fresh image and wipes everything). Match by NAME from the event actor — NOT
+  // Event-driven, no polling. Frigate's nginx.conf comes only from its image: an
+  // nginx restart inside the container (s6) regenerates base_path.conf and
+  // listen.conf, not nginx.conf, and a container restart keeps the writable layer.
+  // So our edits are lost only when the container is RECREATED (an upgrade), which
+  // always emits a `start` event. Match by NAME from the event actor, NOT
   // `--filter container=<name>` (binds to the old id, misses the recreated one).
+  // Start watching BEFORE the first apply so a Frigate start meanwhile isn't missed;
+  // after a dropped stream, reconnect with --since to replay what was missed.
+  let since = null;
   const watch = () => {
-    const ev = spawn('docker', ['events', '--filter', 'type=container', '--filter', 'event=start', '--format', '{{.Actor.Attributes.name}}']);
+    const args = ['events', '--filter', 'type=container', '--filter', 'event=start', '--format', '{{.Actor.Attributes.name}}'];
+    if (since) args.push('--since', String(since));
+    const ev = spawn('docker', args);
+    let reconnecting = false;
+    const reconnect = () => {
+      if (reconnecting) return;
+      reconnecting = true;
+      since = Math.floor(Date.now() / 1000) - 1;
+      setTimeout(watch, 5000);
+    };
     ev.stdout.on('data', (buf) => {
       if (String(buf).split('\n').map((s) => s.trim()).includes(CONTAINER)) {
         state.applied = false;
@@ -211,14 +211,16 @@ async function start() {
       }
     });
     ev.stderr.on('data', () => {});
-    ev.on('close', () => setTimeout(watch, 5000));
-    ev.on('error', () => setTimeout(watch, 5000));
+    ev.on('close', reconnect);
+    ev.on('error', reconnect);
   };
   watch();
+  await ensureWithRetry();
 
-  // Backstop: ensure() re-reads live state, so a missing injection self-heals <30s.
-  // When nothing drifted it is one `docker exec` that changes nothing and no reload.
-  setInterval(() => ensureFromTimer(), 30 * 1000).unref();
+  // Hourly safety net for the unforeseen (a manual edit, a future Frigate that
+  // rebuilds nginx.conf on nginx restart). Costs one `docker exec` and, since
+  // ensure() reloads only on change, no nginx reload.
+  setInterval(() => ensure(), 60 * 60 * 1000).unref();
 }
 
 // Remove ONLY this extension's files + regenerate the combined sub_filter + reload.
